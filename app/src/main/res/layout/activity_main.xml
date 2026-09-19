@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    activity_main.xml — Animal-Avoidance Rover
+    ============================================
+    Full-screen camera preview with:
+      - A custom overlay view for drawing bounding boxes over detections
+      - A status bar at the top showing detection + action + BLE connection state
+      - Optional manual override buttons at the bottom (stop / resume)
+
+    The DetectionOverlayView referenced here (com.example.animalrover.DetectionOverlayView)
+    is a custom View you'd implement separately — draw() loop takes the latest
+    bounding boxes + labels and draws rectangles/text over the preview. Sketch
+    below the layout shows its minimal shape.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <!-- Live camera feed -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Bounding box overlay, drawn on top of the camera preview -->
+    <com.example.animalrover.DetectionOverlayView
+        android:id="@+id/overlayView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Status bar: detection label, current action, BLE connection state -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="vertical"
+        android:background="#88000000"
+        android:padding="12dp">
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No animal detected"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp" />
+
+        <TextView
+            android:id="@+id/bleStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="BLE: disconnected"
+            android:textColor="#FFAA00"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+    <!-- Manual override controls -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="horizontal"
+        android:background="#88000000"
+        android:padding="12dp"
+        android:gravity="center">
+
+        <Button
+            android:id="@+id/emergencyStopButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="16dp"
+            android:text="EMERGENCY STOP"
+            android:backgroundTint="#CC0000"
+            android:textColor="#FFFFFF" />
+
+        <Button
+            android:id="@+id/resumeButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="RESUME AUTO"
+            android:backgroundTint="#008800"
+            android:textColor="#FFFFFF" />
+    </LinearLayout>
+
+</FrameLayout>
+
+<!--
+    Minimal DetectionOverlayView.kt sketch (separate file, not XML):
+
+    class DetectionOverlayView(context: Context, attrs: AttributeSet) : View(context, attrs) {
+        private var boxes: List<RectF> = emptyList()
+        private var labels: List<String> = emptyList()
+        private val paint = Paint().apply {
+            color = Color.RED
+            style = Paint.Style.STROKE
+            strokeWidth = 6f
+        }
+        private val textPaint = Paint().apply {
+            color = Color.RED
+            textSize = 40f
+        }
+
+        fun updateDetections(newBoxes: List<RectF>, newLabels: List<String>) {
+            boxes = newBoxes
+            labels = newLabels
+            postInvalidate() // trigger redraw on the UI thread
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            boxes.forEachIndexed { i, box ->
+                canvas.drawRect(box, paint)
+                canvas.drawText(labels.getOrElse(i) { "" }, box.left, box.top - 10f, textPaint)
+            }
+        }
+    }
+
+    Call overlayView.updateDetections(...) from processFrame() in MainActivity
+    after each detection pass, converting ML Kit's boundingBox (Rect, in image
+    coordinates) into view coordinates that account for the preview's scale
+    and rotation.
+-->

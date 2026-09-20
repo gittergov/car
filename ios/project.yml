@@ -1,0 +1,22 @@
+name: AnimalRover
+options:
+  bundleIdPrefix: com.example
+
+targets:
+  AnimalRover:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Sources
+    info:
+      path: Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSCameraUsageDescription: "Used to detect animals in the rover's path."
+        NSBluetoothAlwaysUsageDescription: "Used to connect to the rover's motor controller."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.animalrover
+        CODE_SIGN_STYLE: Automatic
+        SWIFT_VERSION: "5.0"

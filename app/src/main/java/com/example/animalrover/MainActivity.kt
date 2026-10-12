@@ -1,217 +1,228 @@
-/*
- * Animal-Avoidance Rover Controller — Android App
- * =================================================
- *
- * Architecture:
- *   CameraX (live feed) -> ML Kit Object Detection (on-device, NPU-accelerated)
- *   -> filter to animal-ish detections -> decision logic (stop/turn/slow/forward)
- *   -> send short command string over Bluetooth LE to an ESP32 driving the motors
- *
- * Gradle dependencies needed (add to app/build.gradle):
- *
- *   implementation "androidx.camera:camera-core:1.3.4"
- *   implementation "androidx.camera:camera-camera2:1.3.4"
- *   implementation "androidx.camera:camera-lifecycle:1.3.4"
- *   implementation "androidx.camera:camera-view:1.3.4"
- *   implementation "com.google.mlkit:object-detection:17.0.1"
- *   implementation "com.google.mlkit:object-detection-custom:17.0.1" // if using a custom TFLite model
- *
- * Manifest permissions needed:
- *   <uses-permission android:name="android.permission.CAMERA" />
- *   <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
- *   <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
- *
- * NOTE: ML Kit's stock Object Detection API returns generic categories
- * (e.g. "Animal", "Food", "Plant" — not specific species). This is often
- * good enough for "is there an animal in my path" logic. If you need
- * specific species (dog vs cat vs deer), swap in a custom COCO-trained
- * TFLite model via object-detection-custom instead — the pipeline below
- * works the same either way, just change how `label` is read.
- */
-
 package com.example.animalrover
 
+import android.Manifest
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCharacteristic
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.os.Bundle
+import android.widget.Button
+import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+/**
+ * Camera -> custom deer model (MediaPipe) -> decision logic -> BLE command to ESP32.
+ *
+ * Command codes (must match esp32_motor_controller.ino):
+ *   S stop, F forward, f forward slow, L turn left, R turn right
+ */
 class MainActivity : AppCompatActivity() {
 
-    // --- Config ---------------------------------------------------------
-    private val CONFIDENCE_THRESHOLD = 0.5f
+    // --- Tuning -------------------------------------------------------------
+    private val CENTER_MIN = 0.35f          // horizontal band counted as "in my path"
+    private val CENTER_MAX = 0.65f
+    private val CLOSE_HEIGHT_RATIO = 0.5f   // box taller than this share of frame = very close
+    private val MED_HEIGHT_RATIO = 0.25f
     private val SMOOTHING_WINDOW = 3
+    private val RESEND_MS = 400L            // re-send the same command at most this often
 
-    // Frame is normalized 0.0-1.0 in ML Kit's coordinate space per detection box
-    private val CENTER_ZONE = 0.35f to 0.65f     // x-range considered "in path"
-    private val CLOSE_HEIGHT_RATIO = 0.5f        // bbox height fraction => very close
-    private val MED_HEIGHT_RATIO = 0.25f         // bbox height fraction => moderate distance
+    // --- State --------------------------------------------------------------
+    private lateinit var cameraExecutor: ExecutorService
+    private lateinit var detector: DeerDetector
+    private lateinit var ble: BleController
 
-    // Labels ML Kit's stock detector can return that we treat as "animal".
-    // With the stock (non-custom) API, categories are broad, so "Animal" is
-    // usually the one you'll see. Swap in real species names if using a
-    // custom COCO model instead.
-    private val ANIMAL_LABELS = setOf("Animal")
+    private lateinit var previewView: PreviewView
+    private lateinit var overlayView: DetectionOverlayView
+    private lateinit var statusText: TextView
+    private lateinit var bleStatusText: TextView
 
-    private val actionHistory = ArrayDeque<String>()
-    private var bleGatt: BluetoothGatt? = null
-    private var commandCharacteristic: BluetoothGattCharacteristic? = null
+    private var gatt: BluetoothGatt? = null
+    private var commandChar: BluetoothGattCharacteristic? = null
 
-    private lateinit var cameraExecutor: java.util.concurrent.ExecutorService
+    @Volatile private var manualStop = false
+    private val history = ArrayDeque<String>()
+    private var lastSent = ""
+    private var lastSentAt = 0L
+
+    private val permissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
+            if (grants[Manifest.permission.CAMERA] == true) startCamera()
+            else statusText.text = "Camera permission is required"
+            if (ble.hasRequiredPermissions()) ble.startScan()
+            else bleStatusText.text = "BLE: permission denied"
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main) // your layout with a PreviewView
+        setContentView(R.layout.activity_main)
+
+        previewView = findViewById(R.id.previewView)
+        overlayView = findViewById(R.id.overlayView)
+        statusText = findViewById(R.id.statusText)
+        bleStatusText = findViewById(R.id.bleStatusText)
+
+        findViewById<Button>(R.id.emergencyStopButton).setOnClickListener {
+            manualStop = true
+            sendCommand("S", force = true)
+            statusText.text = "MANUAL STOP"
+        }
+        findViewById<Button>(R.id.resumeButton).setOnClickListener {
+            manualStop = false
+            statusText.text = "Auto mode"
+        }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-        startCamera()
-        // connectToEsp32() — call once you've discovered the ESP32's BLE address,
-        // e.g. via a scan screen or a hardcoded MAC for a single dedicated rover.
+
+        detector = DeerDetector(this) { hits, w, h -> onDetections(hits, w, h) }
+
+        ble = BleController(
+            context = this,
+            onConnected = { runOnUiThread { bleStatusText.text = "BLE: connected, setting up..." } },
+            onDisconnected = {
+                commandChar = null
+                runOnUiThread { bleStatusText.text = "BLE: disconnected" }
+            },
+            onReady = { g, c ->
+                gatt = g
+                commandChar = c
+                runOnUiThread { bleStatusText.text = "BLE: ready" }
+            }
+        )
+
+        permissionLauncher.launch(
+            arrayOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        )
     }
 
-    // --- Camera setup -----------------------------------------------------
+    // --- Camera -------------------------------------------------------------
     private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            val provider = future.get()
 
-            val options = ObjectDetectorOptions.Builder()
-                .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-                .enableClassification()
-                .enableMultipleObjects()
-                .build()
-            val detector = ObjectDetection.getClient(options)
-
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                processFrame(imageProxy, detector)
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
             }
 
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+            analysis.setAnalyzer(cameraExecutor) { proxy -> analyze(proxy) }
 
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(
-                this, cameraSelector, imageAnalysis
+            provider.unbindAll()
+            provider.bindToLifecycle(
+                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis
             )
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // --- Per-frame processing ---------------------------------------------
-    @androidx.camera.core.ExperimentalGetImage
-    private fun processFrame(
-        imageProxy: ImageProxy,
-        detector: com.google.mlkit.vision.objects.ObjectDetector
-    ) {
-        val mediaImage = imageProxy.image
-        if (mediaImage == null) {
-            imageProxy.close()
-            return
+    private fun analyze(proxy: ImageProxy) {
+        try {
+            val rotation = proxy.imageInfo.rotationDegrees
+            val bitmap = proxy.toBitmap()
+            val upright = if (rotation != 0) {
+                Bitmap.createBitmap(
+                    bitmap, 0, 0, bitmap.width, bitmap.height,
+                    Matrix().apply { postRotate(rotation.toFloat()) }, true
+                )
+            } else bitmap
+            detector.detect(upright)
+        } finally {
+            proxy.close()
         }
-
-        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-
-        detector.process(image)
-            .addOnSuccessListener { detectedObjects ->
-                val imgWidth = image.width.toFloat()
-                val imgHeight = image.height.toFloat()
-
-                val animalDetections = detectedObjects.filter { obj ->
-                    obj.labels.any { label ->
-                        ANIMAL_LABELS.contains(label.text) &&
-                            label.confidence >= CONFIDENCE_THRESHOLD
-                    }
-                }
-
-                val rawAction = decideAction(animalDetections, imgWidth, imgHeight)
-                val smoothedAction = smoothAction(rawAction)
-
-                sendCommand(smoothedAction)
-            }
-            .addOnFailureListener {
-                // log/ignore — don't crash the loop on a bad frame
-            }
-            .addOnCompleteListener {
-                imageProxy.close() // always close, or CameraX stalls
-            }
     }
 
-    // --- Decision logic (same shape as the Pi version) ---------------------
-    private fun decideAction(
-        detections: List<com.google.mlkit.vision.objects.DetectedObject>,
-        imgWidth: Float,
-        imgHeight: Float
-    ): String {
-        if (detections.isEmpty()) return "forward"
+    // --- Detections -> action ----------------------------------------------
+    private fun onDetections(hits: List<Hit>, frameW: Int, frameH: Int) {
+        overlayView.update(hits, frameW, frameH)
+        if (manualStop) return
 
-        // Pick the detection with the largest bounding box (closest)
-        val closest = detections.maxByOrNull { it.boundingBox.height() } ?: return "forward"
+        val raw = decide(hits, frameW, frameH)
+        val action = smooth(raw)
 
-        val box = closest.boundingBox
-        val heightRatio = box.height().toFloat() / imgHeight
-        val centerX = (box.left + box.right) / 2f / imgWidth
+        runOnUiThread {
+            statusText.text = if (hits.isEmpty()) "No deer detected -> $action"
+            else "${hits.first().label} detected -> $action"
+        }
 
-        val inPath = centerX in CENTER_ZONE.first..CENTER_ZONE.second
+        sendCommand(
+            when (action) {
+                "stop" -> "S"
+                "turn_left" -> "L"
+                "turn_right" -> "R"
+                "forward_slow" -> "f"
+                else -> "F"
+            }
+        )
+    }
+
+    private fun decide(hits: List<Hit>, w: Int, h: Int): String {
+        if (hits.isEmpty()) return "forward"
+        // The tallest box is the closest animal
+        val closest = hits.maxByOrNull { it.box.height() } ?: return "forward"
+
+        val heightRatio = closest.box.height() / h
+        val centerX = closest.box.centerX() / w
+        val inPath = centerX in CENTER_MIN..CENTER_MAX
 
         return when {
             heightRatio >= CLOSE_HEIGHT_RATIO && inPath -> "stop"
             heightRatio >= MED_HEIGHT_RATIO && inPath ->
-                if (centerX >= 0.5f) "turn_left" else "turn_right"
+                if (centerX >= 0.5f) "turn_left" else "turn_right"   // steer away from it
             inPath -> "forward_slow"
             else -> "forward"
         }
     }
 
-    // --- Smoothing: require an action to persist across recent frames -----
-    private fun smoothAction(action: String): String {
-        actionHistory.addLast(action)
-        if (actionHistory.size > SMOOTHING_WINDOW) actionHistory.removeFirst()
+    /** Act on an action only if it holds across several recent frames; stops win quickly. */
+    private fun smooth(action: String): String {
+        synchronized(history) {
+            history.addLast(action)
+            if (history.size > SMOOTHING_WINDOW) history.removeFirst()
 
-        val stopCount = actionHistory.count { it == "stop" }
-        if (stopCount >= (SMOOTHING_WINDOW - 1).coerceAtLeast(1)) return "stop"
-
-        val matchCount = actionHistory.count { it == action }
-        if (matchCount >= (SMOOTHING_WINDOW / 2 + 1)) return action
-
-        return "forward"
+            if (history.count { it == "stop" } >= (SMOOTHING_WINDOW - 1).coerceAtLeast(1)) return "stop"
+            if (history.count { it == action } >= SMOOTHING_WINDOW / 2 + 1) return action
+            return "forward"
+        }
     }
 
-    // --- BLE command sending -------------------------------------------
-    // Command protocol: single-byte codes the ESP32 will parse.
-    // 'S' = stop, 'F' = forward, 'f' = forward_slow, 'L' = turn_left, 'R' = turn_right
-    private fun sendCommand(action: String) {
-        val code = when (action) {
-            "stop" -> "S"
-            "forward" -> "F"
-            "forward_slow" -> "f"
-            "turn_left" -> "L"
-            "turn_right" -> "R"
-            else -> "F"
+    // --- BLE ----------------------------------------------------------------
+    private fun sendCommand(code: String, force: Boolean = false) {
+        val ch = commandChar ?: return
+        val g = gatt ?: return
+        val now = System.currentTimeMillis()
+        // Avoid flooding BLE with identical writes; always send changes right away
+        if (!force && code == lastSent && now - lastSentAt < RESEND_MS) return
+        lastSent = code
+        lastSentAt = now
+        @Suppress("DEPRECATION")
+        run {
+            ch.value = code.toByteArray(Charsets.UTF_8)
+            g.writeCharacteristic(ch)
         }
-
-        commandCharacteristic?.let { characteristic ->
-            characteristic.value = code.toByteArray(Charsets.UTF_8)
-            bleGatt?.writeCharacteristic(characteristic)
-        }
-        // If BLE isn't connected yet, this is a no-op — add connection-state
-        // handling / a UI indicator so you know the rover isn't receiving commands.
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        sendCommand("S", force = true)
         cameraExecutor.shutdown()
-        bleGatt?.close()
+        detector.close()
+        ble.disconnect()
     }
 }

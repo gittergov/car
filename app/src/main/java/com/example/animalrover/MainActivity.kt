@@ -38,7 +38,7 @@ class MainActivity : AppCompatActivity() {
 
     // --- State --------------------------------------------------------------
     private lateinit var cameraExecutor: ExecutorService
-    private lateinit var detector: DeerDetector
+    private var detector: DeerDetector? = null
     private lateinit var ble: BleController
 
     private lateinit var previewView: PreviewView
@@ -83,7 +83,11 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        detector = DeerDetector(this) { hits, w, h -> onDetections(hits, w, h) }
+        try {
+            detector = DeerDetector(this) { hits, w, h -> onDetections(hits, w, h) }
+        } catch (t: Throwable) {
+            statusText.text = "MODEL ERROR: " + t.javaClass.simpleName + ": " + (t.message ?: "").take(300)
+        }
 
         ble = BleController(
             context = this,
@@ -142,7 +146,9 @@ class MainActivity : AppCompatActivity() {
                     Matrix().apply { postRotate(rotation.toFloat()) }, true
                 )
             } else bitmap
-            detector.detect(upright)
+            detector?.detect(upright)
+        } catch (t: Throwable) {
+            runOnUiThread { statusText.text = "DETECT ERROR: " + t.javaClass.simpleName + ": " + (t.message ?: "").take(300) }
         } finally {
             proxy.close()
         }
@@ -222,7 +228,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         sendCommand("S", force = true)
         cameraExecutor.shutdown()
-        detector.close()
+        detector?.close()
         ble.disconnect()
     }
 }

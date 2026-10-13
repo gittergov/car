@@ -38,6 +38,7 @@ class DeerDetector(
     private val labels: List<String>
     private val inW: Int
     private val inH: Int
+    private val nchw: Boolean
     private val inputBuffer: ByteBuffer
     private val pixels: IntArray
     private val outShape: IntArray
@@ -56,11 +57,12 @@ class DeerDetector(
         require(inTensor.dataType() == DataType.FLOAT32) {
             "Model input must be float32 but is ${inTensor.dataType()}. Re-export without quantization."
         }
-        require(inShape.size == 4 && inShape[3] == 3) {
-            "Unexpected input shape ${inShape.toList()}; expected [1, height, width, 3]."
+        require(inShape.size == 4 && (inShape[3] == 3 || inShape[1] == 3)) {
+            "Unexpected input shape ${inShape.toList()}; expected [1,h,w,3] or [1,3,h,w]."
         }
-        inH = inShape[1]
-        inW = inShape[2]
+        nchw = inShape[1] == 3 && inShape[3] != 3
+        inH = if (nchw) inShape[2] else inShape[1]
+        inW = if (nchw) inShape[3] else inShape[2]
         inputBuffer = ByteBuffer.allocateDirect(4 * inW * inH * 3).order(ByteOrder.nativeOrder())
         pixels = IntArray(inW * inH)
 
@@ -85,10 +87,17 @@ class DeerDetector(
         if (scaled !== frame) scaled.recycle()
 
         inputBuffer.rewind()
-        for (p in pixels) {
-            inputBuffer.putFloat(((p shr 16) and 0xFF) / 255f)
-            inputBuffer.putFloat(((p shr 8) and 0xFF) / 255f)
-            inputBuffer.putFloat((p and 0xFF) / 255f)
+        if (nchw) {
+            // planar: all R, then all G, then all B
+            for (shift in intArrayOf(16, 8, 0)) {
+                for (p in pixels) inputBuffer.putFloat(((p shr shift) and 0xFF) / 255f)
+            }
+        } else {
+            for (p in pixels) {
+                inputBuffer.putFloat(((p shr 16) and 0xFF) / 255f)
+                inputBuffer.putFloat(((p shr 8) and 0xFF) / 255f)
+                inputBuffer.putFloat((p and 0xFF) / 255f)
+            }
         }
         inputBuffer.rewind()
 

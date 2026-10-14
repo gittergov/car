@@ -2,6 +2,9 @@ package com.example.animalrover
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.DataType
@@ -30,10 +33,14 @@ data class Hit(val label: String, val score: Float, val box: RectF)
  */
 class DeerDetector(
     context: Context,
-    private val scoreThreshold: Float = 0.4f,
+    initialScoreThreshold: Float = 0.4f,
     private val iouThreshold: Float = 0.45f,
+    private val farPass: Boolean = true,
     private val onResult: (hits: List<Hit>, frameWidth: Int, frameHeight: Int) -> Unit
 ) {
+    /** Can be changed at runtime (e.g. lowered briefly when motion is seen). */
+    @Volatile var scoreThreshold: Float = initialScoreThreshold
+
     private val interpreter: Interpreter
     private val labels: List<String>
     private val inW: Int
@@ -41,6 +48,9 @@ class DeerDetector(
     private val nchw: Boolean
     private val inputBuffer: ByteBuffer
     private val pixels: IntArray
+    private val lbBitmap: Bitmap
+    private val lbCanvas: Canvas
+    private val lbPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val outShape: IntArray
     private val output: Array<Array<FloatArray>>
 
@@ -65,6 +75,8 @@ class DeerDetector(
         inW = if (nchw) inShape[3] else inShape[2]
         inputBuffer = ByteBuffer.allocateDirect(4 * inW * inH * 3).order(ByteOrder.nativeOrder())
         pixels = IntArray(inW * inH)
+        lbBitmap = Bitmap.createBitmap(inW, inH, Bitmap.Config.ARGB_8888)
+        lbCanvas = Canvas(lbBitmap)
 
         outShape = interpreter.getOutputTensor(0).shape()
         require(outShape.size == 3) { "Unexpected output shape ${outShape.toList()}" }
@@ -79,12 +91,48 @@ class DeerDetector(
         Log.i(TAG, "input=${inShape.toList()} output=${outShape.toList()} labels=$labels")
     }
 
-    /** Runs one frame through the model and reports hits via [onResult] on the calling thread. */
+    /**
+     * Runs one frame through the model and reports hits via [onResult] on the calling thread.
+     *
+     * Two passes, so distant animals show up:
+     *  - near pass: the whole frame, shrunk to the model size (keeps its shape, no stretching)
+     *  - far pass: a square cut from the middle of the frame (around the road ahead) at full
+     *    camera resolution, so a small far-away deer keeps many more pixels
+     */
     @Synchronized
     fun detect(frame: Bitmap) {
-        val scaled = Bitmap.createScaledBitmap(frame, inW, inH, true)
-        scaled.getPixels(pixels, 0, inW, 0, 0, inW, inH)
-        if (scaled !== frame) scaled.recycle()
+        val all = ArrayList<Hit>(runOn(frame))
+
+        if (farPass && min(frame.width, frame.height) >= 700) {
+            val side = (min(frame.width, frame.height) * 0.6f).toInt()
+            val left = ((frame.width - side) / 2).coerceAtLeast(0)
+            val top = (frame.height * 0.45f - side / 2f).toInt().coerceIn(0, frame.height - side)
+            val crop = Bitmap.createBitmap(frame, left, top, side, side)
+            for (h in runOn(crop)) {
+                all.add(
+                    Hit(
+                        h.label, h.score,
+                        RectF(h.box.left + left, h.box.top + top, h.box.right + left, h.box.bottom + top)
+                    )
+                )
+            }
+            crop.recycle()
+        }
+
+        onResult(nms(all), frame.width, frame.height)
+    }
+
+    /** One model run on [src]; returned boxes are in [src] pixel coordinates. */
+    private fun runOn(src: Bitmap): List<Hit> {
+        // Letterbox: keep the aspect ratio, pad the rest with grey (what the model was trained on)
+        val scale = min(inW.toFloat() / src.width, inH.toFloat() / src.height)
+        val dw = src.width * scale
+        val dh = src.height * scale
+        val padX = (inW - dw) / 2f
+        val padY = (inH - dh) / 2f
+        lbCanvas.drawColor(Color.rgb(114, 114, 114))
+        lbCanvas.drawBitmap(src, null, RectF(padX, padY, padX + dw, padY + dh), lbPaint)
+        lbBitmap.getPixels(pixels, 0, inW, 0, 0, inW, inH)
 
         inputBuffer.rewind()
         if (nchw) {
@@ -103,11 +151,17 @@ class DeerDetector(
 
         interpreter.run(inputBuffer, output)
 
-        onResult(decode(frame.width, frame.height), frame.width, frame.height)
+        return decode().map { h ->
+            val box = RectF(
+                (h.box.left - padX) / scale, (h.box.top - padY) / scale,
+                (h.box.right - padX) / scale, (h.box.bottom - padY) / scale
+            )
+            Hit(h.label, h.score, clamp(box, src.width, src.height))
+        }
     }
 
-    // --- Output decoding ----------------------------------------------------
-    private fun decode(frameW: Int, frameH: Int): List<Hit> {
+    // --- Output decoding (boxes come back in model-input pixels) -----------
+    private fun decode(): List<Hit> {
         val a = outShape[1]
         val b = outShape[2]
         val candidates = ArrayList<Hit>()
@@ -118,11 +172,9 @@ class DeerDetector(
                 val r = output[0][i]
                 if (r[4] < scoreThreshold) continue
                 val normalized = max(max(r[0], r[1]), max(r[2], r[3])) <= 1.5f
-                val sx = if (normalized) frameW.toFloat() else frameW.toFloat() / inW
-                val sy = if (normalized) frameH.toFloat() else frameH.toFloat() / inH
-                candidates.add(
-                    Hit(labelFor(r[5].toInt()), r[4], clamp(RectF(r[0] * sx, r[1] * sy, r[2] * sx, r[3] * sy), frameW, frameH))
-                )
+                val sx = if (normalized) inW.toFloat() else 1f
+                val sy = if (normalized) inH.toFloat() else 1f
+                candidates.add(Hit(labelFor(r[5].toInt()), r[4], RectF(r[0] * sx, r[1] * sy, r[2] * sx, r[3] * sy)))
             }
             return candidates
         }
@@ -157,13 +209,13 @@ class DeerDetector(
             }
 
             val normalized = max(max(cx, cy), max(w, h)) <= 1.5f
-            val sx = if (normalized) frameW.toFloat() else frameW.toFloat() / inW
-            val sy = if (normalized) frameH.toFloat() else frameH.toFloat() / inH
+            val sx = if (normalized) inW.toFloat() else 1f
+            val sy = if (normalized) inH.toFloat() else 1f
             val box = RectF(
                 (cx - w / 2f) * sx, (cy - h / 2f) * sy,
                 (cx + w / 2f) * sx, (cy + h / 2f) * sy
             )
-            candidates.add(Hit(labelFor(bestClass), bestScore, clamp(box, frameW, frameH)))
+            candidates.add(Hit(labelFor(bestClass), bestScore, box))
         }
         return nms(candidates)
     }
